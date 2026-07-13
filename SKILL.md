@@ -2,7 +2,7 @@
 name: usage-governor
 description: >-
   Check the user's live claude.ai subscription usage (5-hour session limit, weekly limit, and
-  per-model weekly limits such as Fable) and adapt execution plans to it. Use this whenever the
+  per-model weekly limits, which some models sometimes have, such as Fable) and adapt execution plans to it. Use this whenever the
   user asks about usage, quota, limits, "how much do I have left", "am I close to my limit", or
   when a limit warning appears. Just as importantly, use it proactively on your own initiative:
   BEFORE launching anything large (a Workflow, a wide Agent fan-out, a /loop, a long migration or
@@ -187,8 +187,10 @@ being drawn down; give it extra weight.
 ## Model-scoped limits
 
 The `limits` array can contain `weekly_scoped` entries tied to a specific model via
-`scope_model`. These are per-model weekly budgets that can run out even when overall usage is
-fine, and they matter most for top-tier models used deliberately for judgment-heavy sub-work.
+`scope_model`. Some models sometimes carry their own weekly budget on top of the shared one;
+this is not guaranteed for any model, and the scoped set changes with plans and model line-ups.
+When present, these per-model budgets can run out even when overall usage is fine, and they
+matter most for top-tier models used deliberately for judgment-heavy sub-work.
 
 Which models are scoped, and whether they are scoped at all, is not stable, a model can carry a
 scoped weekly limit for a while and later move to metered usage credits (surfaced as a non-percent

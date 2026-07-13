@@ -152,9 +152,13 @@ resets. You lose some parallelism. You don't lose the run.
 
 ### Per-model budgets: the limit you didn't know you had
 
-Weekly limits can be scoped to a single model, and a top-tier model's budget can run dry while
-your overall usage looks fine. That's the expensive surprise: you delegate a design review to your
-best model and eat a limit warning even though the dashboard says 40%.
+Sometimes a model carries its own weekly limit on top of the shared one. Not always, and not
+always the same model: which models are scoped varies by plan and shifts as the line-up changes
+(Opus, Sonnet, and Fable have each been scoped at various points, and the examples on this page
+use whichever it was when they were written). When a scoped limit exists, a top-tier model's
+budget can run dry while your overall usage looks fine. That's the expensive surprise: you
+delegate a design review to your best model and eat a limit warning even though the dashboard
+says 40%.
 
 The governor checks the scoped limit for the specific model it's about to use, before it uses it.
 If that budget is tight, it swaps the sub-task to an adjacent tier and says so; that's the
