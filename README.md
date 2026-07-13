@@ -248,6 +248,23 @@ To confirm it's wired up, run the CLI once (next section): if it prints your lim
 see them too. To uninstall, delete the folder (`rm -rf ~/.claude/skills/usage-governor`) and, if
 you like, the cache file at `~/.claude/.usage-cache.json`. Nothing else is touched.
 
+## How to use it
+
+There's nothing to call. You just work normally, and Claude reaches for the skill on its own in
+two ways:
+
+- **When you ask about usage.** "How much have I got left?", "am I close to my limit?", "what's
+  my quota look like?", Claude recognizes the intent and checks. No skill name, no special syntax.
+- **On its own, during big work.** This is the point of the thing. Before it spins up a wide
+  agent fan-out, a long migration, or a `/loop`, and at phase boundaries inside them, Claude
+  checks usage and adjusts, unprompted. You don't have to remember to ask.
+
+If you ever want to force a check by hand, `/usage-governor` (or just "check my usage first")
+always works.
+
+One requirement worth repeating: this runs inside **Claude Code**, not claude.ai chat or the API,
+since it reads your local Claude Code credentials.
+
 ## Standalone CLI
 
 The brains live in `scripts/check-usage.py` (Python 3.8+, standard library only). Run it through the
