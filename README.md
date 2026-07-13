@@ -3,12 +3,12 @@
 [![tests](https://github.com/johnlawrimore/usage-governor/actions/workflows/test.yml/badge.svg)](https://github.com/johnlawrimore/usage-governor/actions/workflows/test.yml)
 [![version](https://img.shields.io/badge/version-1.0.0-informational)](CHANGELOG.md)
 [![python](https://img.shields.io/badge/python-3.8%2B-blue)](#standalone-cli)
-[![platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#install)
+[![platforms](<https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey>)](#install)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ### Tired of your agent runs dying at "usage limit reached"?
 
-usage-governor is a [Claude Code](https://claude.com/claude-code) skill that teaches Claude to
+**usage-governor** is a [Claude Code](https://claude.com/claude-code) skill that teaches Claude to
 watch the fuel gauge and drive accordingly: full speed when there's headroom, leaner when it's
 tight, a graceful landing before it hits the wall. It reads your live claude.ai limits (session,
 weekly, and per-model) and, the part that actually matters, exercises judgment about spending
@@ -49,7 +49,7 @@ Claude usage (fetched 0s ago, source: network)
 
 **Jump to:** [The problem](#the-problem-claude-code-flies-blind) ·
 [How it works](#intelligent-throttling-how-it-works) ·
-[Who it's for](#who-this-is-for) ·
+[Who it&#39;s for](#who-this-is-for) ·
 [vs. other usage tools](#why-not-the-usage-tools-you-already-have) ·
 [Trust](#lightweight-secure-and-auditable) ·
 [Install](#install) ·
@@ -189,11 +189,11 @@ and running dry halfway is a real failure:
 
 ## Why not the usage tools you already have?
 
-|  | Data source | Changes Claude's behavior? |
-| --- | --- | --- |
-| `/usage` in Claude Code | Live official quota | No. It's a display; you look, interpret, and re-plan by hand. |
-| Log-based monitors (ccusage and friends) | Spend estimated from local session logs | No. Great retrospective dashboards, but estimates, not your actual quota. |
-| **usage-governor** | Live official quota, plus burn rate and time-to-reset | **Yes. Feeds directly into fleet size, model choice, and scope, automatically.** |
+|                                          | Data source                                           | Changes Claude's behavior?                                                             |
+| ---------------------------------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `/usage` in Claude Code                | Live official quota                                   | No. It's a display; you look, interpret, and re-plan by hand.                          |
+| Log-based monitors (ccusage and friends) | Spend estimated from local session logs               | No. Great retrospective dashboards, but estimates, not your actual quota.              |
+| **usage-governor**                 | Live official quota, plus burn rate and time-to-reset | **Yes. Feeds directly into fleet size, model choice, and scope, automatically.** |
 
 They're complementary: keep your cost dashboard for retrospectives. This fills the gap none of
 them touch, the moment where the number should change what Claude *does next*.
