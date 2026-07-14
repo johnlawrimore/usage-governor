@@ -10,11 +10,14 @@ Data source: the private endpoint GET https://api.anthropic.com/api/oauth/usage 
 behind claude.ai /settings/usage and Claude Code /usage). It is aggressively rate-limited, so this
 script caches responses and only hits the network on a cache miss.
 
-Beyond the raw percents it derives three decision aids so callers do not have to re-implement the
+Beyond the raw percents it derives four decision aids so callers do not have to re-implement the
 policy each time:
   - resets_in_seconds : time-to-reset per limit (models are unreliable at date math)
   - burn              : climb over roughly the last 15+ minutes vs an earlier snapshot ("+6% / 45m")
-  - posture           : normal | frugal | wind_down, from percent + severity + reset
+  - pace              : {ratio, exhaust_seconds} -- current burn vs the rate you can afford before
+                        reset; ratio > 1 means the window empties before it resets
+  - posture           : normal | measured | frugal | conserve | wind_down, the worst rung across
+                        the percent axis (how full) and the pace axis (how fast), plus severity/reset
 
 Design note on brittleness: the endpoint's set of limit "kinds" is NOT assumed to be fixed. Model
 line-ups and billing change often (for example a model moving from a scoped weekly limit to
@@ -31,7 +34,7 @@ Flags:  --json (print only the JSON line)   --fresh (ignore the cache TTL; still
 Env:    CLAUDE_USAGE_CACHE, CLAUDE_USAGE_TTL, CLAUDE_USAGE_429_BACKOFF, CLAUDE_CONFIG_DIR
 Exit:   0 = printed usage data (fresh or stale) OR --help/--version output, 2 = no data
         available / bad flag.
-Version: 1.0.0
+Version: 1.1.0
 
 Author: John Lawrimore (https://github.com/johnlawrimore/usage-governor). MIT license.
 """
@@ -57,7 +60,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 NOW = time.time()
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 def is_num(v):
@@ -77,14 +80,46 @@ HISTORY_MAX_AGE = 21600   # 6h: don't compute burn across gaps older than this
 BURN_MIN_ELAPSED = 120    # need >=2 min between samples for a meaningful delta
 BURN_TARGET_WINDOW = 900  # 15 min: preferred baseline age for a "recent climb" reading
 
-LEVELS = ["normal", "frugal", "wind_down"]
+# The posture ladder, weakest to strongest. Posture is the worst rung reached across two
+# independent axes -- how full a limit is now (percent) and how fast it is heading for empty
+# (pace) -- so a low-percent limit that is burning too fast to survive its own window still
+# escalates. _bump / _relax / _worst walk this list, so inserting rungs Just Works.
+LEVELS = ["normal", "measured", "frugal", "conserve", "wind_down"]
 
-# Percent at which each limit kind enters 'frugal'. These mirror the thresholds in SKILL.md
-# exactly (session and per-model scoped tighten at 75%, the whole weekly allotment at 80%);
-# 'wind_down' is a uniform 90%. Unknown kinds default to the tighter 75% bound. Keep these in
-# lockstep with the prose -- the posture is meant to REMOVE ambiguity, not add a second source.
-FRUGAL_AT = {"session": 75, "weekly_all": 80, "weekly_scoped": 75}
-WIND_DOWN_AT = 90
+# --- Percent axis --------------------------------------------------------------------------
+# Where a limit sits right now. Each kind maps its utilization to a rung via a high-to-low band
+# table: the first threshold at or below the percent wins; below the lowest threshold is
+# 'normal'. These mirror the bands documented in SKILL.md exactly -- keep them in lockstep, the
+# posture is meant to REMOVE ambiguity, not add a second source of truth. The whole weekly
+# allotment (weekly_all) is a multi-day budget where mid-range use is expected, so its low rungs
+# sit a little higher than the short session / per-model windows. Unknown kinds use 'default'.
+PERCENT_BANDS = {
+    "default":    [(97, "wind_down"), (90, "conserve"), (75, "frugal"), (50, "measured")],
+    "weekly_all": [(95, "wind_down"), (90, "conserve"), (80, "frugal"), (55, "measured")],
+}
+
+# --- Pace axis -----------------------------------------------------------------------------
+# Where a limit is heading. pace_ratio = actual burn rate / the rate you could afford and still
+# coast to reset, which is exactly seconds_to_reset / seconds_to_exhaustion. 1.0 means you land
+# on empty right at reset; >1 means you hit the wall early (2.0 = at the halfway mark). Bands are
+# high-to-low like the percent table. Escalation only ever starts at ratio >= 1.0, i.e. only when
+# the current pace would genuinely exhaust the window before it resets.
+PACE_BANDS = [(4.0, "wind_down"), (2.0, "conserve"), (1.25, "frugal"), (1.0, "measured")]
+# Ignore burn smaller than this (percentage points) for pace escalation: a sub-2% wiggle over a
+# short baseline extrapolates to wildly noisy rates, so it must not drive posture on its own.
+PACE_MIN_BURN_DELTA = 2.0
+# Absolute-runway backstop: if the window will empty within this many seconds at the current
+# pace (and it empties before reset, i.e. ratio >= 1), floor posture at 'conserve' no matter how
+# gentle the ratio looks -- "20 minutes of budget left" is alarming even at a ratio near 1.
+PACE_IMMINENT_EXHAUST_S = 1800
+# Only judge pace when the reset is within this horizon. Burn is a ~15-minute reading; extrapolating
+# it linearly across a multi-day weekly window is meaningless (nobody sustains a 15-minute burst for
+# three days), and doing so makes the ratio explode past every middle band so a heavy session would
+# slam a weekly limit straight to wind_down. Within the horizon -- the whole 5-hour session window,
+# and the tail of a weekly window near its reset -- a short burst does project usefully, and the
+# measured/frugal/conserve rungs become reachable. Beyond it, pace reads null (unknown) and the
+# percent axis alone governs. 6h ties to HISTORY_MAX_AGE, the oldest baseline burn will ever use.
+PACE_MAX_HORIZON_S = 21600
 
 # Snapshots kept for burn-rate math; populated from the cache in main().
 HISTORY = []
@@ -503,15 +538,78 @@ def _relax(p):
     return LEVELS[max(LEVELS.index(p) - 1, 0)]
 
 
-def limit_posture(l):
+def _worst(a, b):
+    return a if LEVELS.index(a) >= LEVELS.index(b) else b
+
+
+def pace_info(l):
+    """Return (ratio, exhaust_seconds) for a percent limit that is burning toward its reset, or
+    (None, None) when pace cannot or should not be judged.
+
+    ratio = actual_rate / sustainable_rate, where actual_rate is the recent burn (percent/sec)
+    and sustainable_rate = remaining_percent / seconds_to_reset is the fastest you could spend and
+    still land on empty exactly at reset. Algebraically this is also seconds_to_reset /
+    seconds_to_exhaustion, so ratio > 1 means the current pace empties the window before it
+    resets. exhaust_seconds is the projected wall-clock time to hit 100% at the current rate.
+
+    Guards (each returns None, None): no burn baseline yet; non-percent meter; already full;
+    reset in the past or unknown; reset further out than PACE_MAX_HORIZON_S (a short burst does not
+    project meaningfully across a multi-day window); or a burn delta below PACE_MIN_BURN_DELTA,
+    whose extrapolated rate is too noisy to steer on."""
+    burn = l.get("burn")
+    pct = l.get("percent")
+    reset_s = l.get("resets_in_seconds")
+    if not isinstance(burn, dict) or not is_num(pct) or not is_num(reset_s) or reset_s <= 0:
+        return None, None
+    if reset_s > PACE_MAX_HORIZON_S:
+        return None, None  # too far out for a ~15-min burn to project across; percent axis governs
+    delta = burn.get("delta_percent")
+    over = burn.get("over_seconds")
+    if not is_num(delta) or not is_num(over) or over <= 0 or delta < PACE_MIN_BURN_DELTA:
+        return None, None
+    remaining = 100 - pct
+    if remaining <= 0:
+        return None, None  # already full; the percent axis owns this case
+    actual_rate = delta / over               # percent per second, recent
+    sustainable_rate = remaining / reset_s   # percent per second you can afford
+    exhaust_seconds = remaining / actual_rate
+    ratio = actual_rate / sustainable_rate   # == reset_s / exhaust_seconds
+    return ratio, exhaust_seconds
+
+
+def percent_posture(l):
+    """Rung from how full the limit is right now. A non-percent meter reads as 0 (its severity,
+    handled in limit_posture, is what can still escalate it)."""
     pct = l["percent"] if is_num(l.get("percent")) else 0
-    frugal_at = FRUGAL_AT.get(l.get("kind"), 75)  # default to the tighter bound
-    if pct >= WIND_DOWN_AT:
-        p = "wind_down"
-    elif pct >= frugal_at:
-        p = "frugal"
-    else:
-        p = "normal"
+    bands = PERCENT_BANDS.get(l.get("kind"), PERCENT_BANDS["default"])
+    for thresh, level in bands:  # high-to-low; first threshold at/below pct wins
+        if pct >= thresh:
+            return level
+    return "normal"
+
+
+def pace_posture(l):
+    """Rung from how fast the limit is heading for empty. 'normal' whenever pace can't be judged
+    or the pace is sustainable (ratio < 1)."""
+    ratio, exhaust_seconds = pace_info(l)
+    if ratio is None:
+        return "normal"
+    p = "normal"
+    for thresh, level in PACE_BANDS:  # high-to-low; first threshold at/below ratio wins
+        if ratio >= thresh:
+            p = level
+            break
+    # Absolute-runway backstop: little wall-clock budget left and (ratio >= 1, so p already
+    # escalated) it empties before reset -> at least 'conserve'.
+    if p != "normal" and exhaust_seconds is not None and exhaust_seconds <= PACE_IMMINENT_EXHAUST_S:
+        p = _worst(p, "conserve")
+    return p
+
+
+def limit_posture(l):
+    # Two independent axes -- where the limit is (percent) and where it is heading (pace) --
+    # worst rung wins, so a low-percent limit burning too fast to survive its window still binds.
+    p = _worst(percent_posture(l), pace_posture(l))
     # assumption, unverified as of 2026-07: any severity other than 'normal' is treated as escalated
     if l.get("severity") not in (None, "normal"):
         p = _bump(p)
@@ -548,9 +646,18 @@ def label(l):
 
 
 def render(limits, age_secs, stale, source):
+    # Clamp before any use: a backwards clock jump gives a negative age, which must never print as
+    # "fetched -5s ago" nor push compute_burn's data_at (NOW - age_secs) into the future, which
+    # would inflate every baseline's elapsed and silently drop valid ones.
+    age_secs = max(0, age_secs)
     compute_burn(limits, NOW - age_secs)
+    # Annotate each limit with its pace reading (ratio + projected time-to-exhaustion) so it rides
+    # along in the JSON and can be shown to the user. Depends on burn, so it runs after it.
+    for l in limits:
+        ratio, exhaust_seconds = pace_info(l)
+        l["pace"] = ({"ratio": round(ratio, 2), "exhaust_seconds": int(exhaust_seconds)}
+                     if ratio is not None else None)
     posture, driver = overall_posture(limits)
-    age_secs = max(0, age_secs)  # a backwards clock jump must never print "fetched -5s ago"
     if not JSON_ONLY:
         age_str = (f"{int(age_secs // 60)}m {int(age_secs % 60)}s ago"
                    if age_secs >= 60 else f"{int(age_secs)}s ago")
@@ -571,6 +678,9 @@ def render(limits, age_secs, stale, source):
             burn = l.get("burn")
             burn_str = (f"  +{burn['delta_percent']}% / {short_dur(burn['over_seconds'])}"
                         if burn else "")
+            pace = l.get("pace")
+            pace_str = (f"  pace {pace['ratio']}x (empties in {short_dur(pace['exhaust_seconds'])})"
+                        if pace else "")
             # Show `extra` only when there is no percent to show -- i.e. this is a non-percent
             # meter (e.g. a usage-credit balance) that would otherwise render as a bare "?". For
             # ordinary percent limits `extra` stays in the JSON but out of the human line.
@@ -578,7 +688,7 @@ def render(limits, age_secs, stale, source):
             extra_str = ""
             if extra and not is_num(l["percent"]):
                 extra_str = "  {" + ", ".join(f"{k}={v}" for k, v in extra.items()) + "}"
-            print(f"  {label(l):<24} {pct:>4}{reset_str}{flag_str}{burn_str}{extra_str}")
+            print(f"  {label(l):<24} {pct:>4}{reset_str}{flag_str}{burn_str}{pace_str}{extra_str}")
         if driver and is_num(driver.get("percent")):
             driver_str = f" (driven by {label(driver)} at {round(driver['percent'])}%)"
         elif driver:

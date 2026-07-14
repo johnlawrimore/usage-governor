@@ -156,51 +156,68 @@ class TestLimitPosture(CheckUsageTestCase):
         base.update(overrides)
         return base
 
-    def test_threshold_boundaries_session(self):
-        # session/weekly_scoped frugal_at = 75, wind_down = 90
-        self.assertEqual(self.mod.limit_posture(self._limit(percent=74.9)), "normal")
+    def test_percent_band_boundaries_session(self):
+        # default bands: >=50 measured, >=75 frugal, >=90 conserve, >=97 wind_down
+        self.assertEqual(self.mod.limit_posture(self._limit(percent=49.9)), "normal")
+        self.assertEqual(self.mod.limit_posture(self._limit(percent=50)), "measured")
+        self.assertEqual(self.mod.limit_posture(self._limit(percent=74.9)), "measured")
         self.assertEqual(self.mod.limit_posture(self._limit(percent=75)), "frugal")
-        self.assertEqual(self.mod.limit_posture(self._limit(percent=80)), "frugal")
         self.assertEqual(self.mod.limit_posture(self._limit(percent=89.9)), "frugal")
-        self.assertEqual(self.mod.limit_posture(self._limit(percent=90)), "wind_down")
+        self.assertEqual(self.mod.limit_posture(self._limit(percent=90)), "conserve")
+        self.assertEqual(self.mod.limit_posture(self._limit(percent=96.9)), "conserve")
+        self.assertEqual(self.mod.limit_posture(self._limit(percent=97)), "wind_down")
 
-    def test_threshold_boundaries_weekly_all(self):
-        # weekly_all frugal_at = 80
-        self.assertEqual(self.mod.limit_posture(self._limit(kind="weekly_all", percent=79.9)),
-                          "normal")
-        self.assertEqual(self.mod.limit_posture(self._limit(kind="weekly_all", percent=80)),
-                          "frugal")
+    def test_percent_band_boundaries_weekly_all(self):
+        # weekly_all bands sit higher at the low end: >=55 measured, >=80 frugal,
+        # >=90 conserve, >=95 wind_down
+        w = lambda p: self.mod.limit_posture(self._limit(kind="weekly_all", percent=p))
+        self.assertEqual(w(54.9), "normal")
+        self.assertEqual(w(55), "measured")
+        self.assertEqual(w(79.9), "measured")
+        self.assertEqual(w(80), "frugal")
+        self.assertEqual(w(90), "conserve")
+        self.assertEqual(w(95), "wind_down")
 
     def test_severity_bump(self):
+        # percent 10 -> normal on both axes; an elevated severity bumps one rung -> measured.
         normal = self._limit(percent=10, severity=None)
         bumped = self._limit(percent=10, severity="warning")
         self.assertEqual(self.mod.limit_posture(normal), "normal")
-        self.assertEqual(self.mod.limit_posture(bumped), "frugal")
+        self.assertEqual(self.mod.limit_posture(bumped), "measured")
 
     def test_session_near_reset_relief(self):
-        # wind_down posture (95%), resets in 500s (0 < 500 < 900) -> relaxed one level.
+        # 95% -> conserve; resets in 500s (0 < 500 < 900) -> relaxed one level to frugal.
         near = self._limit(kind="session", percent=95, resets_in_seconds=500)
         self.assertEqual(self.mod.limit_posture(near), "frugal")
         # Same percent but reset far out (>=900s) -> no relief.
         far = self._limit(kind="session", percent=95, resets_in_seconds=1000)
-        self.assertEqual(self.mod.limit_posture(far), "wind_down")
-        # Relief applies only to kind == "session"; weekly_all gets none.
+        self.assertEqual(self.mod.limit_posture(far), "conserve")
+        # Relief applies only to kind == "session"; weekly_all gets none (95% -> wind_down).
         weekly = self._limit(kind="weekly_all", percent=95, resets_in_seconds=500)
         self.assertEqual(self.mod.limit_posture(weekly), "wind_down")
         # resets_in_seconds == 0 or negative does not qualify (must be strictly > 0).
         elapsed = self._limit(kind="session", percent=95, resets_in_seconds=0)
-        self.assertEqual(self.mod.limit_posture(elapsed), "wind_down")
+        self.assertEqual(self.mod.limit_posture(elapsed), "conserve")
 
-    def test_unknown_kind_default_frugal_threshold(self):
+    def test_unknown_kind_uses_default_bands(self):
         unknown = self._limit(kind="mystery_meter", percent=75)
         self.assertEqual(self.mod.limit_posture(unknown), "frugal")
-        below = self._limit(kind="mystery_meter", percent=74)
+        mid = self._limit(kind="mystery_meter", percent=60)
+        self.assertEqual(self.mod.limit_posture(mid), "measured")
+        below = self._limit(kind="mystery_meter", percent=49)
         self.assertEqual(self.mod.limit_posture(below), "normal")
 
-    def test_percentless_meter_with_elevated_severity_drives_frugal(self):
-        # percent is None -> treated as 0 for threshold math, but an elevated severity still
-        # bumps posture (decision 4: code behavior kept, only the docs prose changed).
+    def test_percentless_meter_with_elevated_severity_escalates(self):
+        # percent is None -> treated as 0 for band math (normal), but an elevated severity still
+        # bumps posture one rung -> measured.
         l = self._limit(percent=None, severity="warning")
+        self.assertEqual(self.mod.limit_posture(l), "measured")
+
+    def test_low_percent_high_pace_escalates(self):
+        # The screenshot case: only 20% used, but burning ~1.5x sustainable -> frugal, not normal.
+        # reset 15000s, burn +8% / 1000s -> exhaust in 10000s, ratio 15000/10000 = 1.5.
+        l = self._limit(kind="session", percent=20, resets_in_seconds=15000,
+                        burn={"delta_percent": 8.0, "over_seconds": 1000})
         self.assertEqual(self.mod.limit_posture(l), "frugal")
 
 
@@ -222,6 +239,169 @@ class TestOverallPosture(CheckUsageTestCase):
         posture, driver = self.mod.overall_posture(limits)
         self.assertEqual(posture, "normal")
         self.assertIsNone(driver)
+
+
+# --------------------------------------------------------------------------- pace
+
+class TestPaceInfo(CheckUsageTestCase):
+    def _limit(self, **overrides):
+        base = {"kind": "session", "percent": 20, "resets_in_seconds": 10000,
+                "burn": {"delta_percent": 8.0, "over_seconds": 1000}}
+        base.update(overrides)
+        return base
+
+    def test_ratio_and_exhaust_math(self):
+        # remaining 80%, rate 8%/1000s = 0.008%/s -> exhaust 10000s; sustainable 80/10000 =
+        # 0.008%/s -> ratio exactly 1.0 (lands on empty right at reset).
+        ratio, exhaust = self.mod.pace_info(self._limit())
+        self.assertAlmostEqual(ratio, 1.0, places=6)
+        self.assertAlmostEqual(exhaust, 10000.0, places=6)
+
+    def test_ratio_above_one_when_burning_too_fast(self):
+        # double the burn -> exhaust in 5000s, ratio 10000/5000 = 2.0.
+        ratio, exhaust = self.mod.pace_info(
+            self._limit(burn={"delta_percent": 16.0, "over_seconds": 1000}))
+        self.assertAlmostEqual(ratio, 2.0, places=6)
+        self.assertAlmostEqual(exhaust, 5000.0, places=6)
+
+    def test_ratio_identity_reset_over_exhaust(self):
+        # ratio must equal seconds_to_reset / seconds_to_exhaustion for arbitrary inputs.
+        l = self._limit(percent=37, resets_in_seconds=7200,
+                        burn={"delta_percent": 9.0, "over_seconds": 640})
+        ratio, exhaust = self.mod.pace_info(l)
+        self.assertAlmostEqual(ratio, 7200 / exhaust, places=6)
+
+    def test_small_burn_delta_ignored_as_noise(self):
+        # below PACE_MIN_BURN_DELTA (2.0) the extrapolated rate is too noisy to steer on.
+        ratio, exhaust = self.mod.pace_info(
+            self._limit(burn={"delta_percent": 1.5, "over_seconds": 1000}))
+        self.assertIsNone(ratio)
+        self.assertIsNone(exhaust)
+
+    def test_no_burn_baseline(self):
+        self.assertEqual(self.mod.pace_info(self._limit(burn=None)), (None, None))
+
+    def test_reset_in_past_or_unknown(self):
+        self.assertEqual(self.mod.pace_info(self._limit(resets_in_seconds=0)), (None, None))
+        self.assertEqual(self.mod.pace_info(self._limit(resets_in_seconds=-5)), (None, None))
+        self.assertEqual(self.mod.pace_info(self._limit(resets_in_seconds=None)), (None, None))
+
+    def test_already_full_yields_no_pace(self):
+        self.assertEqual(self.mod.pace_info(self._limit(percent=100)), (None, None))
+
+    def test_reset_beyond_horizon_yields_no_pace(self):
+        # A weekly window days from reset: a ~15-min burst must not extrapolate across it.
+        self.assertEqual(self.mod.pace_info(self._limit(resets_in_seconds=259200)), (None, None))
+
+    def test_horizon_boundary(self):
+        # At exactly the horizon pace is still judged; one second past it is not.
+        at = self._limit(resets_in_seconds=self.mod.PACE_MAX_HORIZON_S,
+                         burn={"delta_percent": 40.0, "over_seconds": 1000})
+        self.assertIsNotNone(self.mod.pace_info(at)[0])
+        past = self._limit(resets_in_seconds=self.mod.PACE_MAX_HORIZON_S + 1,
+                           burn={"delta_percent": 40.0, "over_seconds": 1000})
+        self.assertEqual(self.mod.pace_info(past), (None, None))
+
+    def test_percentless_meter_yields_no_pace(self):
+        self.assertEqual(self.mod.pace_info(self._limit(percent=None)), (None, None))
+
+    def test_malformed_burn_fields_ignored(self):
+        self.assertEqual(
+            self.mod.pace_info(self._limit(burn={"delta_percent": "x", "over_seconds": 1000})),
+            (None, None))
+        self.assertEqual(
+            self.mod.pace_info(self._limit(burn={"delta_percent": 8.0, "over_seconds": 0})),
+            (None, None))
+
+
+class TestPacePosture(CheckUsageTestCase):
+    def _limit(self, ratio_target, percent=20, exhaust=None):
+        """Build a limit whose pace_info yields approximately ratio_target. With remaining and a
+        chosen reset, pick a burn rate so exhaust = reset / ratio_target."""
+        remaining = 100 - percent
+        reset_s = 10000
+        exhaust_s = exhaust if exhaust is not None else reset_s / ratio_target
+        rate = remaining / exhaust_s          # %/s needed to hit that exhaust
+        return {"kind": "session", "percent": percent, "resets_in_seconds": reset_s,
+                "burn": {"delta_percent": rate * 1000, "over_seconds": 1000}}
+
+    def test_sustainable_pace_is_normal(self):
+        self.assertEqual(self.mod.pace_posture(self._limit(0.5)), "normal")
+
+    def test_band_rungs(self):
+        self.assertEqual(self.mod.pace_posture(self._limit(1.1)), "measured")
+        self.assertEqual(self.mod.pace_posture(self._limit(1.5)), "frugal")
+        self.assertEqual(self.mod.pace_posture(self._limit(3.0)), "conserve")
+        self.assertEqual(self.mod.pace_posture(self._limit(5.0)), "wind_down")
+
+    def test_no_burn_is_normal(self):
+        l = {"kind": "session", "percent": 20, "resets_in_seconds": 10000, "burn": None}
+        self.assertEqual(self.mod.pace_posture(l), "normal")
+
+    def test_imminent_exhaustion_floors_at_conserve(self):
+        # Ratio only 1.1 (would be 'measured'), but the window empties in 1500s (< 1800s backstop)
+        # -> floored to conserve. reset 1650s so ratio ~= 1.1.
+        l = {"kind": "session", "percent": 90, "resets_in_seconds": 1650,
+             "burn": {"delta_percent": (10 / 1500) * 1000, "over_seconds": 1000}}
+        ratio, exhaust = self.mod.pace_info(l)
+        self.assertLess(ratio, 1.25)          # would land in 'measured' on ratio alone
+        self.assertLessEqual(exhaust, self.mod.PACE_IMMINENT_EXHAUST_S)
+        self.assertEqual(self.mod.pace_posture(l), "conserve")
+
+    def test_weekly_within_horizon_reaches_middle_rung(self):
+        # Regression for the binary-pace bug: a weekly limit near its reset must be able to land on
+        # a middle rung, not jump straight to wind_down. 85%, 3h to reset, +2%/900s -> exhaust
+        # ~6750s, ratio ~1.6 -> frugal.
+        l = {"kind": "weekly_all", "percent": 85, "resets_in_seconds": 10800,
+             "burn": {"delta_percent": 2.0, "over_seconds": 900}}
+        self.assertEqual(self.mod.pace_posture(l), "frugal")
+
+    def test_weekly_beyond_horizon_pace_is_normal(self):
+        # Same fast burn but reset is days out: a 15-min burst must not extrapolate -> pace normal,
+        # so a heavy session no longer slams the weekly limit to wind_down.
+        l = {"kind": "weekly_all", "percent": 40, "resets_in_seconds": 259200,
+             "burn": {"delta_percent": 3.0, "over_seconds": 900}}
+        self.assertEqual(self.mod.pace_posture(l), "normal")
+
+    def test_imminent_backstop_does_not_fire_when_sustainable(self):
+        # Tiny exhaust window but reset is even sooner (ratio < 1) -> pace is normal, backstop off.
+        l = {"kind": "session", "percent": 90, "resets_in_seconds": 500,
+             "burn": {"delta_percent": (10 / 1000) * 1000, "over_seconds": 1000}}
+        ratio, _ = self.mod.pace_info(l)
+        self.assertLess(ratio, 1.0)
+        self.assertEqual(self.mod.pace_posture(l), "normal")
+
+
+class TestPaceInJsonOutput(CheckUsageTestCase):
+    def test_render_emits_pace_and_pace_driven_posture(self):
+        mod = self.mod
+        mod.HISTORY = [
+            {"at": mod.NOW - 1000, "limits": {"session|": 12.0}, "resets": {"session|": "R"}},
+        ]
+        limits = [{
+            "kind": "session", "percent": 20.0, "resets_at": "R", "resets_in_seconds": 15000,
+            "severity": None, "scope_model": None, "is_active": False, "extra": None,
+        }]
+        code, out = self.run_with_exit(mod.render, limits, 0, False, "cache")
+        payload = json.loads(out.strip().splitlines()[-1])
+        pace = payload["limits"][0]["pace"]
+        self.assertIsNotNone(pace)
+        self.assertAlmostEqual(pace["ratio"], 1.5, places=2)   # 15000s reset / 10000s exhaust
+        self.assertEqual(pace["exhaust_seconds"], 10000)
+        # Low percent (20) but unsustainable pace -> posture is frugal, not normal.
+        self.assertEqual(payload["posture"], "frugal")
+
+    def test_render_pace_null_without_burn_baseline(self):
+        mod = self.mod
+        mod.HISTORY = []
+        limits = [{
+            "kind": "session", "percent": 20.0, "resets_at": "R", "resets_in_seconds": 15000,
+            "severity": None, "scope_model": None, "is_active": False, "extra": None,
+        }]
+        code, out = self.run_with_exit(mod.render, limits, 0, False, "cache")
+        payload = json.loads(out.strip().splitlines()[-1])
+        self.assertIsNone(payload["limits"][0]["pace"])
+        self.assertEqual(payload["posture"], "normal")
 
 
 # --------------------------------------------------------------------------- compute_burn

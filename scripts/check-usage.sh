@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Launcher: locate a WORKING Python 3 interpreter and run check-usage.py with the same arguments.
-# The logic lives in check-usage.py; this wrapper only exists so the documented Unix command
-# (check-usage.sh) keeps working. On Windows use check-usage.cmd instead.
+# The logic lives in check-usage.py; this wrapper only exists so the documented command
+# (check-usage.sh) keeps working.
 #
-# Each candidate is validated with `-c 'import sys'` before use, so under Git Bash on Windows the
-# Microsoft Store "python3" app-execution-alias stub (which just prints an install message and
-# exits nonzero) is skipped rather than exec'd.
+# Each candidate is validated with `-c 'import sys'` before use, so a stub on PATH that merely
+# prints a message and exits nonzero (instead of being a real interpreter) is skipped rather than
+# exec'd.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"

@@ -1,7 +1,7 @@
 # usage-governor
 
 [![tests](https://github.com/johnlawrimore/usage-governor/actions/workflows/test.yml/badge.svg)](https://github.com/johnlawrimore/usage-governor/actions/workflows/test.yml)
-[![version](https://img.shields.io/badge/version-1.0.0-informational)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.1.0-informational)](CHANGELOG.md)
 [![python](https://img.shields.io/badge/python-3.8%2B-blue)](#standalone-cli)
 [![platforms](<https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey>)](#install)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -18,9 +18,11 @@ against them. And it narrates every throttling decision it makes, so nothing cha
 
 - Claude checks your session, weekly, and per-model limits before starting anything big and at
   phase boundaries inside long work. Checks are cache-served, so they cost basically nothing.
-- Below the thresholds it says nothing and runs at full scale. No nagging, no hedging.
-- Above them it shrinks agent fleets, moves grunt work to cheaper models, and skips speculative
-  extra passes. The deliverable itself is never thinned.
+- Below the thresholds, on both how full a limit is and how fast it's burning, it says nothing
+  and runs at full scale. No nagging, no hedging.
+- Above them it works through a five-rung ladder: first it right-sizes fleets and drops
+  speculative passes, then it shrinks agent fleets and moves grunt work to cheaper models. The
+  deliverable itself is never thinned.
 - Near the ceiling it stops taking on new work and lands what's in flight, saved to disk, with
   the reset time so you can decide whether to wait.
 - Every one of those calls is announced: which limit, what percent, when it resets, what changed,
@@ -35,14 +37,15 @@ When there's headroom, nothing changes and nothing is said. When there isn't:
 > Heads up: the Fable weekly limit is at 82% (resets Wednesday 19:00 UTC), so I'll run the design
 > review on Opus instead. Say the word if you want Fable anyway.
 
-Under the hood, that decision came from one cached script call:
+Under the hood, decisions like that begin with a single cached script call. Here is a reading that
+triggers a pullback, this time driven by the 5-hour session rather than a model budget:
 
 ```
 Claude usage (fetched 0s ago, source: network)
-  Session (5h)              82%  resets in 40m    [severity=warning, active]  +9% / 38m
+  Session (5h)              82%  resets in 40m    [severity=warning, active]  +9% / 38m  pace 0.53x (empties in 1h16m)
   Weekly (all models)       72%  resets in 2d 4h
   Weekly (Fable)            82%  resets in 2d 4h  [severity=warning]
-  posture: wind_down (driven by Session (5h) at 82%)
+  posture: conserve (driven by Session (5h) at 82%)
 ```
 
 <!-- TODO: replace the block above with a short terminal GIF (asciinema/vhs) of a real governed run -->
@@ -75,20 +78,25 @@ fuel gauge.
 
 Printing a percentage is easy. The value is in what Claude *does* with it, and a raw percent is a
 terrible basis for a decision: it tells you how full the tank is and nothing about whether you'll
-make the next exit. So the skill hands Claude three signals a bare percent can't provide:
+make the next exit. A limit can be low on percent yet still binding, if it's burning fast enough
+to run dry with hours left on the clock. So the skill scores usage pressure on two independent
+axes and hands Claude the signals behind them:
 
 1. **Time-to-reset.** 90% with four hours to go and 90% ten minutes before the window flips are
    completely different emergencies. The first means wind down; the second means keep working,
    relief is almost here. The skill distinguishes them, and even relaxes its own recommendation
    when a session reset is imminent.
-2. **Burn rate.** How fast a limit is *climbing* over roughly the last 15+ minutes, not a
+2. **Burn rate and pace.** How fast a limit is *climbing* over roughly the last 15+ minutes, not a
    session-long average, e.g. `+6% / 45m`. 74% that crept up 2% today is a shrug; 74% that jumped
-   30% in the last hour is a wall with your name on it. Only the rate can tell them apart, and the
-   rate is what answers the question that actually matters: will this plan fit in what's left?
-3. **A computed posture.** The script scores every limit against fixed thresholds and emits a
-   single recommendation: `normal`, `frugal`, or `wind_down`. It's deterministic, the same inputs
-   always produce the same posture, so Claude isn't re-inventing its own thresholds on the fly and
-   two runs an hour apart can't reach different conclusions from the same numbers.
+   30% in the last hour is a wall with your name on it. From the burn rate the script derives
+   `pace.ratio`, current burn rate divided by the rate you could afford and still coast to reset.
+   A ratio above 1 means the window empties before it resets, no matter how low the percent is,
+   which is exactly the case a percent-only reading misses.
+3. **A computed posture.** The script scores both axes, percent and pace, against fixed
+   thresholds and takes the worse of the two, then emits a single recommendation: `normal`,
+   `measured`, `frugal`, `conserve`, or `wind_down`. It's deterministic, the same inputs always
+   produce the same posture, so Claude isn't re-inventing its own thresholds on the fly and two
+   runs an hour apart can't reach different conclusions from the same numbers.
 
 The whole decision loop at a glance:
 
@@ -101,21 +109,34 @@ flowchart LR
         reset["time to reset<br>in 40m vs in 2 days"]
     end
 
-    posture{"posture<br>(deterministic:<br>same inputs,<br>same answer)"}
-    pct --> posture
-    burn --> posture
-    reset --> posture
+    burn --> pace["pace ratio<br>burn rate vs. rate<br>affordable before reset"]
+    reset --> pace
+
+    pctAxis{"percent axis"}
+    paceAxis{"pace axis"}
+    pct --> pctAxis
+    pace --> paceAxis
+
+    posture{"posture<br>(worst axis wins,<br>deterministic)"}
+    pctAxis --> posture
+    paceAxis --> posture
 
     normal["normal<br>full scale, total silence"]
+    measured["measured<br>right-size fleets,<br>drop speculative passes"]
     frugal["frugal<br>fewer agents, cheaper tiers<br>for grunt work"]
+    conserve["conserve<br>stop expanding scope,<br>checkpoint often"]
     wind["wind_down<br>land in-flight work, save it,<br>report the reset time"]
 
     posture -->|headroom| normal
-    posture -->|"limit at 75-80%"| frugal
-    posture -->|"limit at 90%+"| wind
+    posture -->|"~50%+ or pace ~1.0"| measured
+    posture -->|"~75%+ or pace ~1.25"| frugal
+    posture -->|"~90%+ or pace ~2.0"| conserve
+    posture -->|"~97%+ or pace ~4.0"| wind
 
     announce["announced out loud:<br>which limit, what %, when it resets,<br>what changed + one-line override"]
+    measured --> announce
     frugal --> announce
+    conserve --> announce
     wind --> announce
 
     classDef success fill:#a7f3d0,stroke:#047857,color:#374151
@@ -124,17 +145,23 @@ flowchart LR
     classDef error fill:#fecaca,stroke:#b91c1c,color:#374151
     normal:::success
     posture:::decision
+    pctAxis:::decision
+    paceAxis:::decision
+    measured:::trigger
     frugal:::trigger
+    conserve:::trigger
     wind:::error
 ```
 
 Each posture maps to concrete behavior:
 
-| Posture       | What Claude does                                                                           |
-| ------------- | ------------------------------------------------------------------------------------------ |
-| `normal`    | Full scale, and blessedly quiet: no hedging, no "just so you know, you're at 60%."         |
-| `frugal`    | Fewer agents, cheaper tiers for the grunt work, no speculative victory-lap passes.         |
-| `wind_down` | Stop growing the job. Land what's in flight, save it, and tell you when the window resets. |
+| Posture     | What Claude does                                                                             |
+| ----------- | ---------------------------------------------------------------------------------------------- |
+| `normal`    | Full scale, and blessedly quiet: no hedging, no "just so you know, you're at 60%."             |
+| `measured`  | Right-size fleets instead of maximum fan-out, drop purely speculative extra passes. The task itself is unconstrained. |
+| `frugal`    | Reduce parallelism, prefer cheaper tiers for sub-work, checkpoint sooner, warn before big work. |
+| `conserve`  | Stop expanding scope, cheapest viable tier for all sub-work, checkpoint often, warn up front.   |
+| `wind_down` | Stop growing the job. Land what's in flight, save it, and tell you when the window resets.      |
 
 ### What a governed run actually looks like
 
@@ -253,11 +280,11 @@ you like, the cache file at `~/.claude/.usage-cache.json`. Nothing else is touch
 There's nothing to call. You just work normally, and Claude reaches for the skill on its own in
 two ways:
 
-- **When you ask about usage.** "How much have I got left?", "am I close to my limit?", "what's
-  my quota look like?", Claude recognizes the intent and checks. No skill name, no special syntax.
 - **On its own, during big work.** This is the point of the thing. Before it spins up a wide
   agent fan-out, a long migration, or a `/loop`, and at phase boundaries inside them, Claude
   checks usage and adjusts, unprompted. You don't have to remember to ask.
+- **When you ask about usage.** "How much have I got left?", "am I close to my limit?", "what's
+  my quota look like?", Claude recognizes the intent and checks. No skill name, no special syntax.
 
 If you ever want to force a check by hand, `/usage-governor` (or just "check my usage first")
 always works.
@@ -285,12 +312,12 @@ It prints a human-readable summary followed by one machine-readable JSON line:
 
 ```
 Claude usage (fetched 0s ago, source: network)
-  Session (5h)              82%  resets in 40m (2026-...)  [severity=warning, active]  +9% / 38m
+  Session (5h)              82%  resets in 40m (2026-...)  [severity=warning, active]  +9% / 38m  pace 0.53x (empties in 1h16m)
   Weekly (all models)       72%  resets in 2d 4h (2026-...)
   Weekly (Fable)            75%  resets in 2d 4h (2026-...)  [severity=warning]
-  posture: wind_down (driven by Session (5h) at 82%)
+  posture: conserve (driven by Session (5h) at 82%)
 ---
-{"available": true, "posture": "wind_down", "limits": [ ... ]}
+{"available": true, "posture": "conserve", "limits": [ ... ]}
 ```
 
 Flags: `--json` (JSON only), `--fresh` (bypass the cache TTL; still respects the 429 backoff),
@@ -326,14 +353,25 @@ Each entry in the `limits` array carries:
 - `resets_at` / `resets_in_seconds`: when the window rolls over (ISO 8601 and signed seconds).
 - `burn`: `{delta_percent, over_seconds}` vs an earlier snapshot, or `null` if there's no baseline
   yet.
+- `pace`: `{ratio, exhaust_seconds}` when `burn` is present and pace can be judged (including a
+  sustainable `ratio` below 1), else `null`. `ratio` is current burn rate divided by the rate affordable before reset
+  (`seconds_to_reset / seconds_to_exhaustion`); above 1 means the window empties before it resets,
+  regardless of percent. `null` means unknown, not sustainable.
 - `extra`: any fields the endpoint attached that we don't normalize (e.g. a `remaining_credits`
   balance on a usage-credit meter), kept verbatim so a new kind of budget surfaces instead of
   vanishing.
 
-Top-level `posture` is computed deterministically: a limit is `frugal` at/above its frugal threshold
-(75% for `session` and `weekly_scoped`, 80% for `weekly_all`) and `wind_down` at/above 90%; a
-non-`normal` severity bumps it a level; and a `session` limit within 15 minutes of reset gets
-relaxed a level. Worst limit wins, and `posture_driver` names the culprit.
+Top-level `posture` is computed deterministically as a five-rung ladder, weakest to strongest:
+`normal`, `measured`, `frugal`, `conserve`, `wind_down`. Each limit is scored on two independent
+axes, worst rung wins: the **percent axis** (how full now), which escalates at 50/75/90/97% for
+`session`, `weekly_scoped`, and unknown kinds, and at 55/80/90/95% for `weekly_all`; and the
+**pace axis** (from `pace.ratio`), which escalates at ratio 1.0/1.25/2.0/4.0, with a backstop that
+floors pace at `conserve` when the window will empty within about 30 minutes. The pace axis is only
+applied when the reset is within about 6 hours, since a roughly 15-minute burst does not extrapolate
+across a multi-day window, so a weekly limit days from reset is scored on percent alone. A
+non-`normal` severity bumps the result a level, and a `session` limit within 15 minutes of reset is
+relaxed a level. Worst limit wins across the whole `limits` array, and `posture_driver` names the
+culprit.
 
 ## Caveats
 
@@ -378,8 +416,8 @@ The private endpoint will drift someday. Here's what that looks like and what to
 
 ### Versioning
 
-Semantic versioning, tracked in [CHANGELOG.md](CHANGELOG.md). Current release: **1.0.0**. Last
-verified against the live endpoint: **2026-07-13**.
+Semantic versioning, tracked in [CHANGELOG.md](CHANGELOG.md). Current release: **1.1.0**. Last
+verified against the live endpoint: **2026-07-14**.
 
 ## Layout
 
